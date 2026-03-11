@@ -73,6 +73,8 @@ impl Plugin for CPlugin {
                         release: false,
                         test: false,
                         run: false,
+                        verbose: false,
+                        filter: None,
                     },
                 )?;
                 Ok(LintResult {

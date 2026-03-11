@@ -34,10 +34,17 @@ impl Plugin for GoPlugin {
         let errors = parse_go_errors(&stderr);
 
         if opts.test && output.status.success() {
-            let test_out = Command::new("go")
-                .args(["test", "./..."])
-                .current_dir(path)
-                .output()?;
+            let test_out = if let Some(ref f) = opts.filter {
+                Command::new("go")
+                    .args(["test", "-run", f.as_str(), "./..."])
+                    .current_dir(path)
+                    .output()?
+            } else {
+                Command::new("go")
+                    .args(["test", "./..."])
+                    .current_dir(path)
+                    .output()?
+            };
             let test_stderr = String::from_utf8_lossy(&test_out.stderr).to_string();
             return Ok(BuildResult {
                 success: test_out.status.success(),

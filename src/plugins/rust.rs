@@ -53,7 +53,13 @@ impl Plugin for RustPlugin {
         }
 
         if opts.test && output.status.success() {
-            let test_out = self.cargo(path, &["test"])?;
+            let mut test_args = vec!["test"];
+            let filter_owned;
+            if let Some(ref f) = opts.filter {
+                filter_owned = f.clone();
+                test_args.push(filter_owned.as_str());
+            }
+            let test_out = self.cargo(path, &test_args)?;
             let test_stderr = String::from_utf8_lossy(&test_out.stderr).to_string();
             return Ok(BuildResult {
                 success: test_out.status.success(),

@@ -66,7 +66,7 @@ impl Plugin for TypeScriptPlugin {
         let errors = parse_ts_errors(&combined);
 
         if opts.test && output.status.success() {
-            let test_out = self.run_test(path)?;
+            let test_out = self.run_test(path, opts.filter.as_deref())?;
             let test_combined = String::from_utf8_lossy(&test_out.stderr).to_string();
             return Ok(BuildResult {
                 success: test_out.status.success(),
@@ -164,20 +164,32 @@ impl TypeScriptPlugin {
         Ok(())
     }
 
-    fn run_test(&self, path: &Path) -> Result<std::process::Output> {
+    fn run_test(&self, path: &Path, filter: Option<&str>) -> Result<std::process::Output> {
         Ok(match self.runtime.as_str() {
-            "bun" => Command::new("bun")
-                .args(["test"])
-                .current_dir(path)
-                .output()?,
-            "deno" => Command::new("deno")
-                .args(["test"])
-                .current_dir(path)
-                .output()?,
-            _ => Command::new("npx")
-                .args(["jest"])
-                .current_dir(path)
-                .output()?,
+            "bun" => {
+                let mut args = vec!["test"];
+                if let Some(f) = filter {
+                    args.push(f);
+                }
+                Command::new("bun").args(&args).current_dir(path).output()?
+            }
+            "deno" => {
+                let mut args = vec!["test"];
+                if let Some(f) = filter {
+                    args.extend_from_slice(&["--filter", f]);
+                }
+                Command::new("deno")
+                    .args(&args)
+                    .current_dir(path)
+                    .output()?
+            }
+            _ => {
+                let mut args = vec!["jest"];
+                if let Some(f) = filter {
+                    args.extend_from_slice(&["-t", f]);
+                }
+                Command::new("npx").args(&args).current_dir(path).output()?
+            }
         })
     }
 

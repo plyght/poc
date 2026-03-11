@@ -59,15 +59,33 @@ impl Plugin for PythonPlugin {
 
         if opts.test && output.status.success() {
             let test_out = match self.runner.as_str() {
-                "uv" => Command::new("uv")
-                    .args(["run", "pytest"])
-                    .current_dir(path)
-                    .output()?,
-                "poetry" => Command::new("poetry")
-                    .args(["run", "pytest"])
-                    .current_dir(path)
-                    .output()?,
-                _ => Command::new("pytest").current_dir(path).output()?,
+                "uv" => {
+                    let mut args = vec!["run", "pytest"];
+                    if let Some(ref f) = opts.filter {
+                        args.extend_from_slice(&["-k", f.as_str()]);
+                    }
+                    Command::new("uv").args(&args).current_dir(path).output()?
+                }
+                "poetry" => {
+                    let mut args = vec!["run", "pytest"];
+                    if let Some(ref f) = opts.filter {
+                        args.extend_from_slice(&["-k", f.as_str()]);
+                    }
+                    Command::new("poetry")
+                        .args(&args)
+                        .current_dir(path)
+                        .output()?
+                }
+                _ => {
+                    let mut args = vec!["pytest"];
+                    if let Some(ref f) = opts.filter {
+                        args.extend_from_slice(&["-k", f.as_str()]);
+                    }
+                    Command::new("pytest")
+                        .args(&args)
+                        .current_dir(path)
+                        .output()?
+                }
             };
             let test_stderr = String::from_utf8_lossy(&test_out.stderr).to_string();
             let test_stdout = String::from_utf8_lossy(&test_out.stdout).to_string();

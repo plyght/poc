@@ -1,5 +1,6 @@
 use crate::types::{DetectedProject, Language, Plugin};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const MANIFEST_FILES: &[(&str, Language)] = &[
@@ -66,23 +67,109 @@ pub fn detect_projects(root: &Path, plugins: &[Box<dyn Plugin>]) -> Vec<Detected
 }
 
 pub fn watch_projects(
-    _root: &Path,
+    root: &Path,
     plugins: &[Box<dyn Plugin>],
     projects: &[DetectedProject],
     _config: &crate::config::PocConfig,
     test: bool,
     lint: bool,
 ) {
-    use colored::Colorize;
-    use std::time::{Duration, Instant};
-
     println!(
-        "{} watching {} project(s) for changes...",
-        "poc:".bold(),
-        projects.len()
+        "watching {} project{} — press Ctrl+C to stop",
+        projects.len(),
+        if projects.len() == 1 { "" } else { "s" }
     );
-    println!("  {} press Ctrl+C to stop", "·".dimmed());
 
+    if try_notify_watch(root, plugins, projects, test, lint).is_err() {
+        poll_watch(root, plugins, projects, test, lint);
+    }
+}
+
+fn run_and_report(
+    projects: &[DetectedProject],
+    plugins: &[Box<dyn Plugin>],
+    test: bool,
+    lint: bool,
+) {
+    println!();
+    let ordered = crate::orchestrator::resolve_build_order(projects);
+    let opts = crate::types::BuildOpts {
+        release: false,
+        test,
+        run: false,
+        verbose: false,
+        filter: None,
+    };
+    let build_start = Instant::now();
+    let results = crate::orchestrator::run_build(&ordered, plugins, &opts);
+    let build_elapsed = build_start.elapsed();
+    crate::orchestrator::print_build_results(&results, build_elapsed, false);
+
+    if lint {
+        let lint_opts = crate::types::LintOpts { fix: false, verbose: false };
+        let lint_start = Instant::now();
+        let lint_results = crate::orchestrator::run_lint(&ordered, plugins, &lint_opts);
+        let lint_elapsed = lint_start.elapsed();
+        crate::orchestrator::print_lint_results(&lint_results, lint_elapsed, false);
+    }
+}
+
+fn try_notify_watch(
+    root: &Path,
+    plugins: &[Box<dyn Plugin>],
+    projects: &[DetectedProject],
+    test: bool,
+    lint: bool,
+) -> anyhow::Result<()> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
+
+    loop {
+        match rx.recv() {
+            Ok(Ok(event)) => {
+                let relevant = matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                );
+                if !relevant {
+                    continue;
+                }
+            }
+            Ok(Err(_)) => continue,
+            Err(_) => break,
+        }
+
+        let debounce_end = Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = debounce_end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        run_and_report(projects, plugins, test, lint);
+    }
+
+    Ok(())
+}
+
+fn poll_watch(
+    _root: &Path,
+    plugins: &[Box<dyn Plugin>],
+    projects: &[DetectedProject],
+    test: bool,
+    lint: bool,
+) {
     let mut last_modified = std::collections::HashMap::new();
     for proj in projects {
         if let Ok(meta) = std::fs::metadata(&proj.path) {
@@ -111,30 +198,7 @@ pub fn watch_projects(
             continue;
         }
 
-        println!(
-            "\n{} changes detected in {} project(s)",
-            "poc:".cyan().bold(),
-            changed_projects.len()
-        );
-        let start = Instant::now();
-
-        let ordered = crate::orchestrator::resolve_build_order(&changed_projects);
-        let opts = crate::types::BuildOpts {
-            release: false,
-            test,
-            run: false,
-        };
-        let results = crate::orchestrator::run_build(&ordered, plugins, &opts);
-        crate::orchestrator::print_build_results(&results);
-
-        if lint {
-            let lint_opts = crate::types::LintOpts { fix: false };
-            let lint_results = crate::orchestrator::run_lint(&ordered, plugins, &lint_opts);
-            crate::orchestrator::print_lint_results(&lint_results);
-        }
-
-        let elapsed = start.elapsed();
-        println!("{} done in {:.1}s", "poc:".bold(), elapsed.as_secs_f64());
+        run_and_report(&changed_projects, plugins, test, lint);
     }
 }
 

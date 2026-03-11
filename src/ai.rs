@@ -5,6 +5,7 @@ use colored::Colorize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub struct AiFixer {
     config: AiConfig,
@@ -49,11 +50,11 @@ impl AiFixer {
         }
 
         println!(
-            "{} {} errors to fix via {} ({})",
-            "ai-fix:".cyan().bold(),
-            diagnostics.len(),
+            "ai-fix via {} ({}) — {} error{}",
             self.config.provider,
-            self.config.model
+            self.config.model.dimmed(),
+            diagnostics.len(),
+            if diagnostics.len() == 1 { "" } else { "s" }
         );
 
         let mut grouped: HashMap<PathBuf, Vec<&LintDiagnostic>> = HashMap::new();
@@ -77,6 +78,8 @@ impl AiFixer {
             rolled_back: 0,
         };
 
+        let total_start = Instant::now();
+
         for (file_path, diags) in &file_groups {
             let source = match std::fs::read_to_string(file_path) {
                 Ok(s) => s,
@@ -87,11 +90,15 @@ impl AiFixer {
             };
 
             let backup = source.clone();
-            let file_display = file_path.display().to_string();
+            let fallback = file_path.display().to_string();
+            let file_display = file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&fallback)
+                .to_string();
 
             println!(
-                "  {} {} ({} error{})",
-                "fixing".yellow(),
+                "  fixing {} ({} error{})",
                 file_display,
                 diags.len(),
                 if diags.len() == 1 { "" } else { "s" }
@@ -115,11 +122,18 @@ impl AiFixer {
                  Return the complete fixed file. No explanations, just code."
             );
 
+            println!(
+                "    requesting fix from {}...",
+                self.config.provider.dimmed()
+            );
+
+            let call_start = Instant::now();
             let llm_result = match self.config.provider.as_str() {
                 "anthropic" => self.call_anthropic(&prompt),
                 "ollama" => self.call_ollama(&prompt),
                 _ => self.call_openai_compatible(&prompt),
             };
+            let call_elapsed = call_start.elapsed();
 
             match llm_result {
                 Ok(response) => {
@@ -127,12 +141,16 @@ impl AiFixer {
                     if response.is_empty() || response.len() < min_len {
                         std::fs::write(file_path, &backup)?;
                         report.rolled_back += 1;
-                        println!("    {} response too short or empty, rolled back", "✗".red());
+                        println!("    {} response too short, rolled back", "✗".red());
                     } else {
                         let fixed = strip_code_fences(&response);
                         std::fs::write(file_path, fixed)?;
                         report.fixed += 1;
-                        println!("    {} applied", "✓".green());
+                        println!(
+                            "    {} applied {}",
+                            "✓".green(),
+                            format!("[{}ms]", call_elapsed.as_millis()).dimmed()
+                        );
                     }
                 }
                 Err(e) => {
@@ -142,12 +160,14 @@ impl AiFixer {
             }
         }
 
+        let total_elapsed = total_start.elapsed();
+        println!();
         println!(
-            "\n{} {} fixed, {} failed, {} rolled back",
-            "ai-fix summary:".bold(),
+            "{} fixed, {} failed, {} rolled back {}",
             report.fixed,
             report.failed,
-            report.rolled_back
+            report.rolled_back,
+            format!("[{}ms]", total_elapsed.as_millis()).dimmed()
         );
 
         Ok(report)
@@ -264,6 +284,8 @@ fn count_project_errors(project_path: &Path, plugins: &[Box<dyn Plugin>]) -> usi
             release: false,
             test: false,
             run: false,
+            verbose: false,
+            filter: None,
         },
     ) {
         count += build_result.errors.len();
@@ -272,7 +294,7 @@ fn count_project_errors(project_path: &Path, plugins: &[Box<dyn Plugin>]) -> usi
         }
     }
 
-    if let Ok(lint_result) = plugin.lint(project_path, &LintOpts { fix: false }) {
+    if let Ok(lint_result) = plugin.lint(project_path, &LintOpts { fix: false, verbose: false }) {
         count += lint_result.diagnostics.len();
     }
 

@@ -15,9 +15,15 @@ use types::*;
 const EXIT_BUILD_FAIL: i32 = 1;
 const EXIT_LINT_FAIL: i32 = 2;
 const EXIT_AI_FAIL: i32 = 3;
+const EXIT_NO_PROJECTS: i32 = 4;
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.no_color {
+        colored::control::set_override(false);
+    }
+
     let cwd = std::env::current_dir().expect("failed to get cwd");
 
     let mut config = PocConfig::load(&cwd).unwrap_or_default();
@@ -60,17 +66,20 @@ fn main() {
     if projects.is_empty() {
         eprintln!(
             "{} no projects detected in {}",
-            "poc:".bold(),
+            "error:".red().bold(),
             cwd.display()
         );
-        std::process::exit(EXIT_BUILD_FAIL);
+        std::process::exit(EXIT_NO_PROJECTS);
     }
 
     if !cli.quiet {
-        println!("{} detected {} project(s)", "poc:".bold(), projects.len());
+        println!("poc v{}", env!("CARGO_PKG_VERSION"));
+        println!();
+        println!("{} projects detected", projects.len());
         for p in &projects {
             println!("  {} {} ({})", "·".dimmed(), p.path.display(), p.language);
         }
+        println!();
     }
 
     let projects = if let Some(ref lang) = cli.filter {
@@ -108,21 +117,27 @@ fn main() {
                 release: cli.release,
                 test,
                 run,
+                verbose: cli.verbose,
+                filter: None,
             };
+            let build_start = std::time::Instant::now();
             let results = orchestrator::run_build(&ordered, &plugins, &opts);
+            let build_elapsed = build_start.elapsed();
             if cli.json {
                 orchestrator::print_json_build_results(&results);
             } else {
-                orchestrator::print_build_results(&results);
+                orchestrator::print_build_results(&results, build_elapsed, cli.verbose);
             }
 
             if lint || fix {
-                let lint_opts = LintOpts { fix: false };
+                let lint_opts = LintOpts { fix: false, verbose: cli.verbose };
+                let lint_start = std::time::Instant::now();
                 let lint_results = orchestrator::run_lint(&ordered, &plugins, &lint_opts);
+                let lint_elapsed = lint_start.elapsed();
                 if cli.json {
                     orchestrator::print_json_lint_results(&lint_results);
                 } else {
-                    orchestrator::print_lint_results(&lint_results);
+                    orchestrator::print_lint_results(&lint_results, lint_elapsed, cli.verbose);
                 }
 
                 if fix {
@@ -131,7 +146,7 @@ fn main() {
                     match fixer.fix_diagnostics(&all_diags, &plugins) {
                         Ok(_) => {}
                         Err(e) => {
-                            eprintln!("{} ai fix failed: {e}", "error:".red());
+                            eprintln!("{} ai fix failed: {e}", "error:".red().bold());
                             std::process::exit(EXIT_AI_FAIL);
                         }
                     }
@@ -143,12 +158,14 @@ fn main() {
             }
         }
         Command::Lint { fix } => {
-            let opts = LintOpts { fix };
+            let opts = LintOpts { fix, verbose: cli.verbose };
+            let lint_start = std::time::Instant::now();
             let results = orchestrator::run_lint(&ordered, &plugins, &opts);
+            let lint_elapsed = lint_start.elapsed();
             if cli.json {
                 orchestrator::print_json_lint_results(&results);
             } else {
-                orchestrator::print_lint_results(&results);
+                orchestrator::print_lint_results(&results, lint_elapsed, cli.verbose);
             }
 
             if orchestrator::has_lint_failures(&results) {
@@ -168,11 +185,19 @@ fn main() {
                 release: false,
                 test: false,
                 run: false,
+                verbose: cli.verbose,
+                filter: None,
             };
+            let build_start = std::time::Instant::now();
             let build_results = orchestrator::run_build(&ordered, &plugins, &build_opts);
+            let build_elapsed = build_start.elapsed();
+            orchestrator::print_build_results(&build_results, build_elapsed, cli.verbose);
 
-            let lint_opts = LintOpts { fix: false };
+            let lint_opts = LintOpts { fix: false, verbose: cli.verbose };
+            let lint_start = std::time::Instant::now();
             let lint_results = orchestrator::run_lint(&ordered, &plugins, &lint_opts);
+            let lint_elapsed = lint_start.elapsed();
+            orchestrator::print_lint_results(&lint_results, lint_elapsed, cli.verbose);
 
             let all_diags = orchestrator::collect_all_diagnostics(&build_results, &lint_results);
 
@@ -183,15 +208,15 @@ fn main() {
             match fixer.fix_diagnostics(&all_diags, &plugins) {
                 Ok(_report) => {}
                 Err(e) => {
-                    eprintln!("{} ai fix failed: {e}", "error:".red());
+                    eprintln!("{} ai fix failed: {e}", "error:".red().bold());
                     std::process::exit(EXIT_AI_FAIL);
                 }
             }
         }
         Command::Init => match config::generate_config(&cwd, &projects) {
-            Ok(_) => println!("{} initialized .poc/config.toml", "poc:".bold()),
+            Ok(_) => println!("initialized .poc/config.toml"),
             Err(e) => {
-                eprintln!("{} {e}", "error:".red());
+                eprintln!("{} {e}", "error:".red().bold());
                 std::process::exit(EXIT_BUILD_FAIL);
             }
         },
@@ -203,10 +228,13 @@ fn main() {
                 release: false,
                 test: true,
                 run: false,
+                verbose: cli.verbose,
+                filter,
             };
+            let build_start = std::time::Instant::now();
             let results = orchestrator::run_build(&ordered, &plugins, &opts);
-            let _ = filter;
-            orchestrator::print_build_results(&results);
+            let build_elapsed = build_start.elapsed();
+            orchestrator::print_build_results(&results, build_elapsed, cli.verbose);
 
             if orchestrator::has_failures(&results) {
                 std::process::exit(EXIT_BUILD_FAIL);

@@ -67,10 +67,13 @@ pub struct BuildOpts {
     pub release: bool,
     pub test: bool,
     pub run: bool,
+    pub verbose: bool,
+    pub filter: Option<String>,
 }
 
 pub struct LintOpts {
     pub fix: bool,
+    pub verbose: bool,
 }
 
 pub trait Plugin: Send + Sync {

@@ -29,8 +29,14 @@ impl Plugin for ZigPlugin {
         let errors = parse_zig_errors(&stderr);
 
         if opts.test && output.status.success() {
+            let mut test_args = vec!["build", "test"];
+            let filter_owned;
+            if let Some(ref f) = opts.filter {
+                filter_owned = format!("--test-filter={}", f);
+                test_args.push(filter_owned.as_str());
+            }
             let test_out = Command::new("zig")
-                .args(["build", "test"])
+                .args(&test_args)
                 .current_dir(path)
                 .output()?;
             let test_stderr = String::from_utf8_lossy(&test_out.stderr).to_string();

@@ -2,6 +2,10 @@ use crate::types::*;
 use colored::Colorize;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+pub type BuildEntry = (DetectedProject, anyhow::Result<BuildResult>, bool, Duration);
+
 pub fn resolve_build_order(projects: &[DetectedProject]) -> Vec<DetectedProject> {
     let mut graph: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut in_degree: HashMap<usize, usize> = HashMap::new();
@@ -183,44 +187,47 @@ pub fn run_build(
     projects: &[DetectedProject],
     plugins: &[Box<dyn Plugin>],
     opts: &BuildOpts,
-) -> Vec<(DetectedProject, anyhow::Result<BuildResult>)> {
+) -> Vec<BuildEntry> {
     let independent = find_independent_groups(projects);
 
-    let mut results = Vec::new();
+    let mut results: Vec<BuildEntry> = Vec::new();
     for group in independent {
-        let group_results: Vec<_> = group
+        let group_results: Vec<BuildEntry> = group
             .par_iter()
             .filter_map(|proj| {
                 let plugin = plugins.iter().find(|p| p.language() == proj.language)?;
                 if is_cached(proj) {
-                    println!(
-                        "{} {} ({}) (cached)",
-                        "skipping".dimmed(),
-                        proj.path.display(),
-                        proj.language
-                    );
+                    if opts.verbose {
+                        if let Some(hash) = compute_project_hash(&proj.path) {
+                            println!(
+                                "cache hit {} ({}) hash={}",
+                                proj.path.display(),
+                                proj.language,
+                                hash
+                            );
+                        }
+                    }
                     return Some((
                         proj.clone(),
                         Ok(BuildResult {
                             success: true,
-                            output: "cached".into(),
+                            output: String::new(),
                             errors: vec![],
                         }),
+                        true,
+                        Duration::ZERO,
                     ));
                 }
-                println!(
-                    "{} {} ({})",
-                    "building".green().bold(),
-                    proj.path.display(),
-                    proj.language
-                );
+                println!("building {} ({})", proj.path.display(), proj.language);
+                let t = Instant::now();
                 let result = plugin.build(&proj.path, opts);
+                let elapsed = t.elapsed();
                 if let Ok(ref r) = result {
                     if r.success {
                         update_cache(proj);
                     }
                 }
-                Some((proj.clone(), result))
+                Some((proj.clone(), result, false, elapsed))
             })
             .collect();
         results.extend(group_results);
@@ -300,12 +307,10 @@ pub fn run_lint(
         .par_iter()
         .filter_map(|proj| {
             let plugin = plugins.iter().find(|p| p.language() == proj.language)?;
-            println!(
-                "{} {} ({})",
-                "linting".cyan().bold(),
-                proj.path.display(),
-                proj.language
-            );
+            println!("linting {} ({})", proj.path.display(), proj.language);
+            if opts.verbose {
+                println!("  {} checking {}", "·".dimmed(), proj.language);
+            }
             let result = plugin.lint(&proj.path, opts);
             Some((proj.clone(), result))
         })
@@ -315,71 +320,121 @@ pub fn run_lint(
 pub fn run_clean(projects: &[DetectedProject], plugins: &[Box<dyn Plugin>]) {
     for proj in projects {
         if let Some(plugin) = plugins.iter().find(|p| p.language() == proj.language) {
-            println!(
-                "{} {} ({})",
-                "cleaning".yellow().bold(),
-                proj.path.display(),
-                proj.language
-            );
+            println!("cleaning {} ({})", proj.path.display(), proj.language);
             if let Err(e) = plugin.clean(&proj.path) {
-                eprintln!("  {} {e}", "error:".red());
+                eprintln!("  {} {e}", "error:".red().bold());
             }
         }
     }
 }
 
-pub fn print_build_results(results: &[(DetectedProject, anyhow::Result<BuildResult>)]) {
-    println!("\n{}", "── build results ──".bold());
-    for (proj, result) in results {
+pub fn print_build_results(results: &[BuildEntry], elapsed: Duration, verbose: bool) {
+    let mut built = 0usize;
+    let mut cached = 0usize;
+    let mut failed = 0usize;
+
+    println!();
+    for (proj, result, was_cached, proj_elapsed) in results {
         match result {
-            Ok(r) if r.success => {
+            Ok(r) if r.success && *was_cached => {
+                cached += 1;
                 println!(
-                    "  {} {} ({})",
-                    "✓".green(),
+                    "{} {} ({}) {}",
+                    "+".green(),
                     proj.path.display(),
-                    proj.language
+                    proj.language,
+                    "(cached)".dimmed()
                 );
             }
-            Ok(r) => {
+            Ok(r) if r.success => {
+                built += 1;
                 println!(
-                    "  {} {} ({})",
-                    "✗".red(),
+                    "{} {} ({}) {}",
+                    "+".green(),
                     proj.path.display(),
-                    proj.language
+                    proj.language,
+                    format!("[{}ms]", proj_elapsed.as_millis()).dimmed()
+                );
+                if verbose && !r.output.is_empty() {
+                    for line in r.output.lines() {
+                        println!("    {}", line.dimmed());
+                    }
+                }
+            }
+            Ok(r) => {
+                failed += 1;
+                println!(
+                    "{} {} ({}) -- build failed {}",
+                    "x".red(),
+                    proj.path.display(),
+                    proj.language,
+                    format!("[{}ms]", proj_elapsed.as_millis()).dimmed()
                 );
                 for err in &r.errors {
+                    let sev = match err.severity {
+                        Severity::Error => "error".red(),
+                        Severity::Warning => "warning".yellow(),
+                        Severity::Info => "info".blue(),
+                        Severity::Hint => "hint".dimmed(),
+                    };
                     println!(
-                        "    {}:{}:{} {}",
-                        err.file,
-                        err.line,
-                        err.col,
-                        err.message.dimmed()
+                        "    {}:{}:{} {} [{}] {}",
+                        err.file, err.line, err.col, sev, err.rule, err.message
                     );
                 }
                 if r.errors.is_empty() && !r.output.is_empty() {
-                    for line in r.output.lines().take(10) {
+                    let limit = if verbose { usize::MAX } else { 10 };
+                    for line in r.output.lines().take(limit) {
                         println!("    {}", line.dimmed());
                     }
                 }
             }
             Err(e) => {
-                println!("  {} {} — {e}", "✗".red(), proj.path.display());
+                failed += 1;
+                println!(
+                    "{} {} ({}) -- {e}",
+                    "x".red(),
+                    proj.path.display(),
+                    proj.language
+                );
             }
         }
     }
+
+    println!();
+    let total_built = built + cached;
+    if failed > 0 {
+        println!(
+            "{} built, {} cached, {} failed {}",
+            built,
+            cached,
+            failed,
+            format!("[{}ms]", elapsed.as_millis()).dimmed()
+        );
+    } else {
+        println!(
+            "{} built, {} cached {}",
+            total_built,
+            cached,
+            format!("[{}ms]", elapsed.as_millis()).dimmed()
+        );
+    }
 }
 
-pub fn print_lint_results(results: &[(DetectedProject, anyhow::Result<LintResult>)]) {
-    let mut total = 0usize;
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
+pub fn print_lint_results(
+    results: &[(DetectedProject, anyhow::Result<LintResult>)],
+    elapsed: Duration,
+    verbose: bool,
+) {
+    let mut linted = 0usize;
+    let mut total_errors = 0usize;
+    let mut total_warnings = 0usize;
 
-    println!("\n{}", "── lint results ──".bold());
+    println!();
     for (proj, result) in results {
         match result {
             Ok(r) => {
-                let diag_count = r.diagnostics.len();
-                total += diag_count;
+                linted += 1;
                 let err_count = r
                     .diagnostics
                     .iter()
@@ -390,28 +445,26 @@ pub fn print_lint_results(results: &[(DetectedProject, anyhow::Result<LintResult
                     .iter()
                     .filter(|d| d.severity == Severity::Warning)
                     .count();
-                errors += err_count;
-                warnings += warn_count;
+                total_errors += err_count;
+                total_warnings += warn_count;
 
-                if diag_count == 0 {
+                if r.diagnostics.is_empty() {
                     println!(
-                        "  {} {} ({})",
-                        "✓".green(),
+                        "{} {} ({})",
+                        "+".green(),
                         proj.path.display(),
                         proj.language
                     );
                 } else {
                     println!(
-                        "  {} {} ({}) — {} issues",
-                        if err_count > 0 {
-                            "✗".red()
-                        } else {
-                            "⚠".yellow()
-                        },
+                        "{} {} ({}) -- {} issue{}",
+                        if err_count > 0 { "x".red() } else { "!".yellow() },
                         proj.path.display(),
                         proj.language,
-                        diag_count
+                        r.diagnostics.len(),
+                        if r.diagnostics.len() == 1 { "" } else { "s" }
                     );
+                    let _ = verbose;
                     for d in &r.diagnostics {
                         let sev = match d.severity {
                             Severity::Error => "error".red(),
@@ -430,31 +483,35 @@ pub fn print_lint_results(results: &[(DetectedProject, anyhow::Result<LintResult
                 }
             }
             Err(e) => {
-                println!("  {} {} — {e}", "✗".red(), proj.path.display());
+                println!(
+                    "{} {} ({}) -- {e}",
+                    "x".red(),
+                    proj.path.display(),
+                    proj.language
+                );
             }
         }
     }
 
-    let exit_status = if errors > 0 {
-        "✗".red()
-    } else if warnings > 0 {
-        "⚠".yellow()
-    } else {
-        "✓".green()
-    };
+    println!();
     println!(
-        "\n  {} {} total, {} errors, {} warnings",
-        exit_status, total, errors, warnings
+        "{} linted, {} error{}, {} warning{} {}",
+        linted,
+        total_errors,
+        if total_errors == 1 { "" } else { "s" },
+        total_warnings,
+        if total_warnings == 1 { "" } else { "s" },
+        format!("[{}ms]", elapsed.as_millis()).dimmed()
     );
 }
 
 pub fn collect_all_diagnostics(
-    build_results: &[(DetectedProject, anyhow::Result<BuildResult>)],
+    build_results: &[BuildEntry],
     lint_results: &[(DetectedProject, anyhow::Result<LintResult>)],
 ) -> Vec<(std::path::PathBuf, LintDiagnostic)> {
     let mut all = Vec::new();
 
-    for (proj, result) in build_results {
+    for (proj, result, _cached, _elapsed) in build_results {
         if let Ok(r) = result {
             for d in &r.errors {
                 all.push((proj.path.clone(), d.clone()));
@@ -472,8 +529,8 @@ pub fn collect_all_diagnostics(
     all
 }
 
-pub fn has_failures(results: &[(DetectedProject, anyhow::Result<BuildResult>)]) -> bool {
-    results.iter().any(|(_, r)| match r {
+pub fn has_failures(results: &[BuildEntry]) -> bool {
+    results.iter().any(|(_, r, _, _)| match r {
         Ok(r) => !r.success,
         Err(_) => true,
     })
@@ -491,7 +548,7 @@ pub fn print_status(
     plugins: &[Box<dyn Plugin>],
     config: &crate::config::PocConfig,
 ) {
-    println!("\n{}", "── project status ──".bold());
+    println!("projects");
     for proj in projects {
         let plugin = plugins.iter().find(|p| p.language() == proj.language);
         let status = if plugin.is_some() {
@@ -508,7 +565,8 @@ pub fn print_status(
         );
     }
 
-    println!("\n{}", "── toolchain ──".bold());
+    println!();
+    println!("toolchain");
     println!(
         "  {} ts runtime: {}, pm: {}",
         "·".dimmed(),
@@ -530,7 +588,8 @@ pub fn print_status(
         config.ai.model
     );
 
-    println!("\n{}", "── dependency order ──".bold());
+    println!();
+    println!("dependency order");
     for (i, proj) in projects.iter().enumerate() {
         println!(
             "  {}. {} ({})",
@@ -540,7 +599,8 @@ pub fn print_status(
         );
     }
 
-    println!("\n{}", "── lint config ──".bold());
+    println!();
+    println!("lint config");
     println!("  {} ts: {}", "·".dimmed(), config.lint.ts);
     println!("  {} python: {}", "·".dimmed(), config.lint.python);
     println!("  {} rust: {}", "·".dimmed(), config.lint.rust);
@@ -586,7 +646,7 @@ pub fn print_graph(projects: &[DetectedProject], dot: bool) {
         }
         println!("}}");
     } else {
-        println!("\n{}", "── dependency graph ──".bold());
+        println!("dependency graph");
         for proj in projects {
             let name = proj.path.file_name().unwrap_or_default().to_string_lossy();
             let mut deps = Vec::new();
@@ -607,14 +667,14 @@ pub fn print_graph(projects: &[DetectedProject], dot: bool) {
                     "  {} ({}) {}",
                     name,
                     proj.language,
-                    "← (no dependencies)".dimmed()
+                    "<- (no dependencies)".dimmed()
                 );
             } else {
                 println!(
                     "  {} ({}) {} {}",
                     name,
                     proj.language,
-                    "←".dimmed(),
+                    "<-".dimmed(),
                     deps.join(", ")
                 );
             }
@@ -622,14 +682,16 @@ pub fn print_graph(projects: &[DetectedProject], dot: bool) {
     }
 }
 
-pub fn print_json_build_results(results: &[(DetectedProject, anyhow::Result<BuildResult>)]) {
+pub fn print_json_build_results(results: &[BuildEntry]) {
     let items: Vec<serde_json::Value> = results
         .iter()
-        .map(|(proj, result)| match result {
+        .map(|(proj, result, cached, elapsed)| match result {
             Ok(r) => serde_json::json!({
                 "path": proj.path.display().to_string(),
                 "language": proj.language.to_string(),
                 "success": r.success,
+                "cached": cached,
+                "elapsed_ms": elapsed.as_millis(),
                 "errors": r.errors.iter().map(|e| serde_json::json!({
                     "file": e.file, "line": e.line, "col": e.col,
                     "rule": e.rule, "severity": format!("{:?}", e.severity),
@@ -640,6 +702,8 @@ pub fn print_json_build_results(results: &[(DetectedProject, anyhow::Result<Buil
                 "path": proj.path.display().to_string(),
                 "language": proj.language.to_string(),
                 "success": false,
+                "cached": cached,
+                "elapsed_ms": elapsed.as_millis(),
                 "error": e.to_string()
             }),
         })

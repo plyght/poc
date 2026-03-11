@@ -53,6 +53,9 @@ pub struct Cli {
 
     #[arg(short, long, global = true, help = "Quiet mode — errors only")]
     pub quiet: bool,
+
+    #[arg(long, global = true, help = "Disable colored output")]
+    pub no_color: bool,
 }
 
 #[derive(Subcommand, Debug)]
