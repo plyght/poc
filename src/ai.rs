@@ -285,6 +285,7 @@ fn try_apply_unified_diff(source: &str, diff: &str) -> Option<String> {
     let mut removals = Vec::new();
     let mut additions = Vec::new();
 
+    let re = regex::Regex::new(r"@@ -(\d+)").ok()?;
     for diff_line in diff.lines() {
         if diff_line.starts_with("@@") {
             if in_hunk && !removals.is_empty() {
@@ -293,7 +294,6 @@ fn try_apply_unified_diff(source: &str, diff: &str) -> Option<String> {
                 additions.clear();
             }
             in_hunk = true;
-            let re = regex::Regex::new(r"@@ -(\d+)").ok()?;
             let cap = re.captures(diff_line)?;
             hunk_start = cap[1].parse::<usize>().ok()?.saturating_sub(1);
         } else if in_hunk {

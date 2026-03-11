@@ -65,7 +65,7 @@ fn project_depends_on(a: &DetectedProject, b: &DetectedProject) -> bool {
             let cargo_toml = a_path.join("Cargo.toml");
             if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
                 if let Some(b_name) = b_path.file_name().and_then(|n| n.to_str()) {
-                    if content.contains(&format!("path = "))
+                    if content.contains("path = ")
                         && content.contains(
                             &b_path
                                 .strip_prefix(a_path.parent().unwrap_or(a_path))
