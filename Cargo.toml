@@ -1,7 +1,16 @@
 [package]
-name = "poc"
+name = "poc-build"
 version = "0.1.0"
 edition = "2021"
+description = "Polyglot build tool that detects, orchestrates, and AI-fixes projects across six languages"
+license = "MIT"
+repository = "https://github.com/plyght/poc"
+keywords = ["build", "polyglot", "orchestrator", "lint", "ai"]
+categories = ["development-tools", "development-tools::build-utils"]
+
+[[bin]]
+name = "poc"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
