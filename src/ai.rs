@@ -294,7 +294,13 @@ fn count_project_errors(project_path: &Path, plugins: &[Box<dyn Plugin>]) -> usi
         }
     }
 
-    if let Ok(lint_result) = plugin.lint(project_path, &LintOpts { fix: false, verbose: false }) {
+    if let Ok(lint_result) = plugin.lint(
+        project_path,
+        &LintOpts {
+            fix: false,
+            verbose: false,
+        },
+    ) {
         count += lint_result.diagnostics.len();
     }
 

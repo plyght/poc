@@ -106,7 +106,10 @@ fn run_and_report(
     crate::orchestrator::print_build_results(&results, build_elapsed, false);
 
     if lint {
-        let lint_opts = crate::types::LintOpts { fix: false, verbose: false };
+        let lint_opts = crate::types::LintOpts {
+            fix: false,
+            verbose: false,
+        };
         let lint_start = Instant::now();
         let lint_results = crate::orchestrator::run_lint(&ordered, plugins, &lint_opts);
         let lint_elapsed = lint_start.elapsed();

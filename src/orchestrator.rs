@@ -458,7 +458,11 @@ pub fn print_lint_results(
                 } else {
                     println!(
                         "{} {} ({}) -- {} issue{}",
-                        if err_count > 0 { "x".red() } else { "!".yellow() },
+                        if err_count > 0 {
+                            "x".red()
+                        } else {
+                            "!".yellow()
+                        },
                         proj.path.display(),
                         proj.language,
                         r.diagnostics.len(),

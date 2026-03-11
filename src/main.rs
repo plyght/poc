@@ -130,7 +130,10 @@ fn main() {
             }
 
             if lint || fix {
-                let lint_opts = LintOpts { fix: false, verbose: cli.verbose };
+                let lint_opts = LintOpts {
+                    fix: false,
+                    verbose: cli.verbose,
+                };
                 let lint_start = std::time::Instant::now();
                 let lint_results = orchestrator::run_lint(&ordered, &plugins, &lint_opts);
                 let lint_elapsed = lint_start.elapsed();
@@ -158,7 +161,10 @@ fn main() {
             }
         }
         Command::Lint { fix } => {
-            let opts = LintOpts { fix, verbose: cli.verbose };
+            let opts = LintOpts {
+                fix,
+                verbose: cli.verbose,
+            };
             let lint_start = std::time::Instant::now();
             let results = orchestrator::run_lint(&ordered, &plugins, &opts);
             let lint_elapsed = lint_start.elapsed();
@@ -193,7 +199,10 @@ fn main() {
             let build_elapsed = build_start.elapsed();
             orchestrator::print_build_results(&build_results, build_elapsed, cli.verbose);
 
-            let lint_opts = LintOpts { fix: false, verbose: cli.verbose };
+            let lint_opts = LintOpts {
+                fix: false,
+                verbose: cli.verbose,
+            };
             let lint_start = std::time::Instant::now();
             let lint_results = orchestrator::run_lint(&ordered, &plugins, &lint_opts);
             let lint_elapsed = lint_start.elapsed();
