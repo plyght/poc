@@ -34,7 +34,7 @@ pub struct LintResult {
     pub diagnostics: Vec<LintDiagnostic>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
     Go,

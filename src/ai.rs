@@ -3,15 +3,25 @@ use crate::types::*;
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde_json::json;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 pub struct AiFixer {
     config: AiConfig,
+    max_fixes: Option<usize>,
 }
 
 impl AiFixer {
     pub fn new(config: AiConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            max_fixes: None,
+        }
+    }
+
+    pub fn with_max_fixes(mut self, max: Option<usize>) -> Self {
+        self.max_fixes = max;
+        self
     }
 
     pub fn with_overrides(mut self, provider: Option<&str>, model: Option<&str>) -> Self {
@@ -26,8 +36,8 @@ impl AiFixer {
 
     pub fn fix_diagnostics(
         &self,
-        diagnostics: &[(std::path::PathBuf, LintDiagnostic)],
-        plugins: &[Box<dyn Plugin>],
+        diagnostics: &[(PathBuf, LintDiagnostic)],
+        _plugins: &[Box<dyn Plugin>],
     ) -> Result<FixReport> {
         if diagnostics.is_empty() {
             println!("{}", "no errors to fix".green());
@@ -46,20 +56,29 @@ impl AiFixer {
             self.config.model
         );
 
+        let mut grouped: HashMap<PathBuf, Vec<&LintDiagnostic>> = HashMap::new();
+        for (project_path, diag) in diagnostics {
+            let file_path = if Path::new(&diag.file).is_absolute() {
+                PathBuf::from(&diag.file)
+            } else {
+                project_path.join(&diag.file)
+            };
+            grouped.entry(file_path).or_default().push(diag);
+        }
+
+        let file_groups: Vec<_> = grouped
+            .into_iter()
+            .take(self.max_fixes.unwrap_or(usize::MAX))
+            .collect();
+
         let mut report = FixReport {
             fixed: 0,
             failed: 0,
             rolled_back: 0,
         };
 
-        for (project_path, diag) in diagnostics {
-            let file_path = if Path::new(&diag.file).is_absolute() {
-                std::path::PathBuf::from(&diag.file)
-            } else {
-                project_path.join(&diag.file)
-            };
-
-            let source = match std::fs::read_to_string(&file_path) {
+        for (file_path, diags) in &file_groups {
+            let source = match std::fs::read_to_string(file_path) {
                 Ok(s) => s,
                 Err(_) => {
                     report.failed += 1;
@@ -67,44 +86,53 @@ impl AiFixer {
                 }
             };
 
-            let context = extract_context(&source, diag.line, 10);
             let backup = source.clone();
+            let file_display = file_path.display().to_string();
 
             println!(
-                "  {} {}:{}:{} — {}",
+                "  {} {} ({} error{})",
                 "fixing".yellow(),
-                diag.file,
-                diag.line,
-                diag.col,
-                diag.message.dimmed()
+                file_display,
+                diags.len(),
+                if diags.len() == 1 { "" } else { "s" }
             );
 
-            let error_count_before = count_project_errors(project_path, plugins);
+            let mut error_lines = String::new();
+            for d in diags.iter() {
+                error_lines.push_str(&format!(
+                    "- Line {}:{} [{}]: {}\n",
+                    d.line, d.col, d.rule, d.message
+                ));
+                if let Some(ref s) = d.suggestion {
+                    error_lines.push_str(&format!("  {}\n", s));
+                }
+            }
 
-            match self.get_fix(&diag.file, &context, diag) {
-                Ok(diff_output) => {
-                    let new_source = apply_diff(&source, &diff_output, diag.line, 10);
-                    std::fs::write(&file_path, &new_source)?;
+            let prompt = format!(
+                "Fix these errors in `{file_display}`:\n\n\
+                 {error_lines}\n\
+                 Code:\n```\n{source}\n```\n\n\
+                 Return the complete fixed file. No explanations, just code."
+            );
 
-                    let error_count_after = count_project_errors(project_path, plugins);
+            let llm_result = match self.config.provider.as_str() {
+                "anthropic" => self.call_anthropic(&prompt),
+                "ollama" => self.call_ollama(&prompt),
+                _ => self.call_openai_compatible(&prompt),
+            };
 
-                    if error_count_after >= error_count_before {
-                        std::fs::write(&file_path, backup)?;
+            match llm_result {
+                Ok(response) => {
+                    let min_len = source.len() / 2;
+                    if response.is_empty() || response.len() < min_len {
+                        std::fs::write(file_path, &backup)?;
                         report.rolled_back += 1;
-                        println!(
-                            "    {} error count did not decrease ({} -> {}), rolled back",
-                            "✗".red(),
-                            error_count_before,
-                            error_count_after
-                        );
+                        println!("    {} response too short or empty, rolled back", "✗".red());
                     } else {
+                        let fixed = strip_code_fences(&response);
+                        std::fs::write(file_path, fixed)?;
                         report.fixed += 1;
-                        println!(
-                            "    {} applied ({} -> {} errors)",
-                            "✓".green(),
-                            error_count_before,
-                            error_count_after
-                        );
+                        println!("    {} applied", "✓".green());
                     }
                 }
                 Err(e) => {
@@ -123,29 +151,6 @@ impl AiFixer {
         );
 
         Ok(report)
-    }
-
-    fn get_fix(&self, file: &str, context: &str, diag: &LintDiagnostic) -> Result<String> {
-        let prompt = format!(
-            "Fix this error in `{file}`.\n\n\
-             Error: {} [{}] at line {}:{}\n\
-             {}\n\n\
-             Code context:\n```\n{context}\n```\n\n\
-             Return a unified diff (--- a/file, +++ b/file, @@ hunks) for the fix. \
-             If you cannot produce a valid diff, return ONLY the fixed code for the context shown. \
-             No explanations.",
-            diag.message,
-            diag.rule,
-            diag.line,
-            diag.col,
-            diag.suggestion.as_deref().unwrap_or("")
-        );
-
-        match self.config.provider.as_str() {
-            "anthropic" => self.call_anthropic(&prompt),
-            "ollama" => self.call_ollama(&prompt),
-            _ => self.call_openai_compatible(&prompt),
-        }
     }
 
     fn call_ollama(&self, prompt: &str) -> Result<String> {
@@ -230,6 +235,20 @@ pub struct FixReport {
     pub rolled_back: usize,
 }
 
+fn strip_code_fences(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix("```") {
+        let after_lang =
+            inner.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '-');
+        let after_newline = after_lang.strip_prefix('\n').unwrap_or(after_lang);
+        if let Some(body) = after_newline.strip_suffix("```") {
+            return body.trim_end_matches('\n');
+        }
+    }
+    s
+}
+
+#[allow(dead_code)]
 fn count_project_errors(project_path: &Path, plugins: &[Box<dyn Plugin>]) -> usize {
     let lang = detect_language_from_path(project_path);
     let plugin = match plugins.iter().find(|p| p.language() == lang) {
@@ -260,6 +279,7 @@ fn count_project_errors(project_path: &Path, plugins: &[Box<dyn Plugin>]) -> usi
     count
 }
 
+#[allow(dead_code)]
 fn extract_context(source: &str, line: usize, radius: usize) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let start = line.saturating_sub(radius + 1);
@@ -267,57 +287,7 @@ fn extract_context(source: &str, line: usize, radius: usize) -> String {
     lines[start..end].join("\n")
 }
 
-fn apply_diff(source: &str, ai_output: &str, line: usize, radius: usize) -> String {
-    if ai_output.contains("---") && ai_output.contains("+++") && ai_output.contains("@@") {
-        if let Some(result) = try_apply_unified_diff(source, ai_output) {
-            return result;
-        }
-    }
-
-    apply_context_fix(source, line, radius, ai_output)
-}
-
-fn try_apply_unified_diff(source: &str, diff: &str) -> Option<String> {
-    let mut lines: Vec<String> = source.lines().map(|l| l.to_string()).collect();
-    let mut in_hunk = false;
-    let mut hunk_start: usize = 0;
-    let mut offset: isize = 0;
-    let mut removals = Vec::new();
-    let mut additions = Vec::new();
-
-    let re = regex::Regex::new(r"@@ -(\d+)").ok()?;
-    for diff_line in diff.lines() {
-        if diff_line.starts_with("@@") {
-            if in_hunk && !removals.is_empty() {
-                apply_hunk(&mut lines, hunk_start, &mut offset, &removals, &additions);
-                removals.clear();
-                additions.clear();
-            }
-            in_hunk = true;
-            let cap = re.captures(diff_line)?;
-            hunk_start = cap[1].parse::<usize>().ok()?.saturating_sub(1);
-        } else if in_hunk {
-            if let Some(stripped) = diff_line.strip_prefix('-') {
-                removals.push(stripped.to_string());
-            } else if let Some(stripped) = diff_line.strip_prefix('+') {
-                additions.push(stripped.to_string());
-            } else if diff_line.starts_with("---") || diff_line.starts_with("+++") {
-                continue;
-            }
-        }
-    }
-
-    if in_hunk && !removals.is_empty() {
-        apply_hunk(&mut lines, hunk_start, &mut offset, &removals, &additions);
-    }
-
-    if !removals.is_empty() || in_hunk {
-        Some(lines.join("\n"))
-    } else {
-        None
-    }
-}
-
+#[allow(dead_code)]
 fn apply_hunk(
     lines: &mut Vec<String>,
     start: usize,
@@ -345,22 +315,7 @@ fn apply_hunk(
     *offset += additions.len() as isize - removals.len() as isize;
 }
 
-fn apply_context_fix(source: &str, line: usize, radius: usize, fixed: &str) -> String {
-    let lines: Vec<&str> = source.lines().collect();
-    let start = line.saturating_sub(radius + 1);
-    let end = (line + radius).min(lines.len());
-
-    let mut result = Vec::new();
-    result.extend_from_slice(&lines[..start]);
-    for fixed_line in fixed.lines() {
-        result.push(fixed_line);
-    }
-    if end < lines.len() {
-        result.extend_from_slice(&lines[end..]);
-    }
-    result.join("\n")
-}
-
+#[allow(dead_code)]
 fn detect_language_from_path(path: &Path) -> Language {
     if path.join("Cargo.toml").exists() {
         return Language::Rust;

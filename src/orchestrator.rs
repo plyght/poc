@@ -192,6 +192,22 @@ pub fn run_build(
             .par_iter()
             .filter_map(|proj| {
                 let plugin = plugins.iter().find(|p| p.language() == proj.language)?;
+                if is_cached(proj) {
+                    println!(
+                        "{} {} ({}) (cached)",
+                        "skipping".dimmed(),
+                        proj.path.display(),
+                        proj.language
+                    );
+                    return Some((
+                        proj.clone(),
+                        Ok(BuildResult {
+                            success: true,
+                            output: "cached".into(),
+                            errors: vec![],
+                        }),
+                    ));
+                }
                 println!(
                     "{} {} ({})",
                     "building".green().bold(),
@@ -199,6 +215,11 @@ pub fn run_build(
                     proj.language
                 );
                 let result = plugin.build(&proj.path, opts);
+                if let Ok(ref r) = result {
+                    if r.success {
+                        update_cache(proj);
+                    }
+                }
                 Some((proj.clone(), result))
             })
             .collect();
@@ -208,27 +229,65 @@ pub fn run_build(
 }
 
 fn find_independent_groups(projects: &[DetectedProject]) -> Vec<Vec<DetectedProject>> {
-    let mut groups: Vec<Vec<DetectedProject>> = Vec::new();
-    let mut seen: HashSet<usize> = HashSet::new();
+    let n = projects.len();
+    if n == 0 {
+        return Vec::new();
+    }
 
-    for (i, proj) in projects.iter().enumerate() {
-        if seen.contains(&i) {
-            continue;
-        }
-        let mut group = vec![proj.clone()];
-        seen.insert(i);
+    let mut graph: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
 
-        for (j, other) in projects.iter().enumerate().skip(i + 1) {
-            if seen.contains(&j) {
+    for i in 0..n {
+        graph.entry(i).or_default();
+        in_degree.entry(i).or_insert(0);
+    }
+
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
                 continue;
             }
-            if !project_depends_on(other, proj) && !project_depends_on(proj, other) {
-                group.push(other.clone());
-                seen.insert(j);
+            if project_depends_on(&projects[i], &projects[j]) {
+                graph.entry(j).or_default().push(i);
+                *in_degree.entry(i).or_insert(0) += 1;
             }
         }
-        groups.push(group);
     }
+
+    let mut groups: Vec<Vec<DetectedProject>> = Vec::new();
+    let mut remaining: HashSet<usize> = (0..n).collect();
+
+    while !remaining.is_empty() {
+        let mut level: Vec<usize> = remaining
+            .iter()
+            .copied()
+            .filter(|i| in_degree[i] == 0)
+            .collect();
+        level.sort();
+
+        if level.is_empty() {
+            let mut rest: Vec<DetectedProject> =
+                remaining.iter().map(|&i| projects[i].clone()).collect();
+            rest.sort_by_key(|p| p.path.clone());
+            groups.push(rest);
+            break;
+        }
+
+        let group: Vec<DetectedProject> = level.iter().map(|&i| projects[i].clone()).collect();
+        groups.push(group);
+
+        for &idx in &level {
+            remaining.remove(&idx);
+            if let Some(dependents) = graph.get(&idx) {
+                for &dep in dependents {
+                    if let Some(deg) = in_degree.get_mut(&dep) {
+                        *deg -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     groups
 }
 
@@ -425,4 +484,252 @@ pub fn has_lint_failures(results: &[(DetectedProject, anyhow::Result<LintResult>
         Ok(r) => !r.success,
         Err(_) => true,
     })
+}
+
+pub fn print_status(
+    projects: &[DetectedProject],
+    plugins: &[Box<dyn Plugin>],
+    config: &crate::config::PocConfig,
+) {
+    println!("\n{}", "── project status ──".bold());
+    for proj in projects {
+        let plugin = plugins.iter().find(|p| p.language() == proj.language);
+        let status = if plugin.is_some() {
+            "ready".green()
+        } else {
+            "no plugin".red()
+        };
+        println!(
+            "  {} {} ({}) [{}]",
+            "·".dimmed(),
+            proj.path.display(),
+            proj.language,
+            status
+        );
+    }
+
+    println!("\n{}", "── toolchain ──".bold());
+    println!(
+        "  {} ts runtime: {}, pm: {}",
+        "·".dimmed(),
+        config.ts.runtime,
+        config.ts.package_manager
+    );
+    println!("  {} python runner: {}", "·".dimmed(), config.python.runner);
+    println!(
+        "  {} c compiler: {}, build: {}",
+        "·".dimmed(),
+        config.c.compiler,
+        config.c.build_system
+    );
+    println!("  {} rust linker: {}", "·".dimmed(), config.rust.linker);
+    println!(
+        "  {} ai: {} ({})",
+        "·".dimmed(),
+        config.ai.provider,
+        config.ai.model
+    );
+
+    println!("\n{}", "── dependency order ──".bold());
+    for (i, proj) in projects.iter().enumerate() {
+        println!(
+            "  {}. {} ({})",
+            i + 1,
+            proj.path.file_name().unwrap_or_default().to_string_lossy(),
+            proj.language
+        );
+    }
+
+    println!("\n{}", "── lint config ──".bold());
+    println!("  {} ts: {}", "·".dimmed(), config.lint.ts);
+    println!("  {} python: {}", "·".dimmed(), config.lint.python);
+    println!("  {} rust: {}", "·".dimmed(), config.lint.rust);
+}
+
+pub fn print_graph(projects: &[DetectedProject], dot: bool) {
+    if dot {
+        println!("digraph poc {{");
+        println!("  rankdir=LR;");
+        println!("  node [shape=box];");
+        for proj in projects {
+            let name = proj.path.file_name().unwrap_or_default().to_string_lossy();
+            println!("  \"{}\" [label=\"{} ({})\"];", name, name, proj.language);
+        }
+        for (i, proj_a) in projects.iter().enumerate() {
+            for proj_b in projects.iter().skip(i + 1) {
+                if project_depends_on(proj_a, proj_b) {
+                    let a = proj_a
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let b = proj_b
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    println!("  \"{}\" -> \"{}\";", a, b);
+                } else if project_depends_on(proj_b, proj_a) {
+                    let a = proj_a
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let b = proj_b
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    println!("  \"{}\" -> \"{}\";", b, a);
+                }
+            }
+        }
+        println!("}}");
+    } else {
+        println!("\n{}", "── dependency graph ──".bold());
+        for proj in projects {
+            let name = proj.path.file_name().unwrap_or_default().to_string_lossy();
+            let mut deps = Vec::new();
+            for other in projects {
+                if project_depends_on(proj, other) {
+                    deps.push(
+                        other
+                            .path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+            }
+            if deps.is_empty() {
+                println!(
+                    "  {} ({}) {}",
+                    name,
+                    proj.language,
+                    "← (no dependencies)".dimmed()
+                );
+            } else {
+                println!(
+                    "  {} ({}) {} {}",
+                    name,
+                    proj.language,
+                    "←".dimmed(),
+                    deps.join(", ")
+                );
+            }
+        }
+    }
+}
+
+pub fn print_json_build_results(results: &[(DetectedProject, anyhow::Result<BuildResult>)]) {
+    let items: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(proj, result)| match result {
+            Ok(r) => serde_json::json!({
+                "path": proj.path.display().to_string(),
+                "language": proj.language.to_string(),
+                "success": r.success,
+                "errors": r.errors.iter().map(|e| serde_json::json!({
+                    "file": e.file, "line": e.line, "col": e.col,
+                    "rule": e.rule, "severity": format!("{:?}", e.severity),
+                    "message": e.message
+                })).collect::<Vec<_>>()
+            }),
+            Err(e) => serde_json::json!({
+                "path": proj.path.display().to_string(),
+                "language": proj.language.to_string(),
+                "success": false,
+                "error": e.to_string()
+            }),
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&items).unwrap_or_default()
+    );
+}
+
+pub fn print_json_lint_results(results: &[(DetectedProject, anyhow::Result<LintResult>)]) {
+    let items: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(proj, result)| match result {
+            Ok(r) => serde_json::json!({
+                "path": proj.path.display().to_string(),
+                "language": proj.language.to_string(),
+                "success": r.success,
+                "diagnostics": r.diagnostics.iter().map(|d| serde_json::json!({
+                    "file": d.file, "line": d.line, "col": d.col,
+                    "rule": d.rule, "severity": format!("{:?}", d.severity),
+                    "message": d.message, "suggestion": d.suggestion
+                })).collect::<Vec<_>>()
+            }),
+            Err(e) => serde_json::json!({
+                "path": proj.path.display().to_string(),
+                "language": proj.language.to_string(),
+                "success": false,
+                "error": e.to_string()
+            }),
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&items).unwrap_or_default()
+    );
+}
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+fn compute_project_hash(project_path: &std::path::Path) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let walker = walkdir::WalkDir::new(project_path)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !name.starts_with('.')
+                && name != "node_modules"
+                && name != "target"
+                && name != "build"
+                && name != "zig-cache"
+                && name != "__pycache__"
+        });
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read(entry.path()) {
+            entry.path().hash(&mut hasher);
+            content.hash(&mut hasher);
+        }
+    }
+    Some(hasher.finish())
+}
+
+fn project_cache_dir(project_path: &std::path::Path) -> std::path::PathBuf {
+    project_path.join(".poc").join("cache")
+}
+
+pub fn is_cached(project: &DetectedProject) -> bool {
+    let hash = match compute_project_hash(&project.path) {
+        Some(h) => h,
+        None => return false,
+    };
+    let cache_file = project_cache_dir(&project.path).join("build.hash");
+    match std::fs::read_to_string(&cache_file) {
+        Ok(cached) => cached.trim() == hash.to_string(),
+        Err(_) => false,
+    }
+}
+
+pub fn update_cache(project: &DetectedProject) {
+    if let Some(hash) = compute_project_hash(&project.path) {
+        let dir = project_cache_dir(&project.path);
+        let _ = std::fs::create_dir_all(&dir);
+        let cache_file = dir.join("build.hash");
+        let _ = std::fs::write(cache_file, hash.to_string());
+    }
 }

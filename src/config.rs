@@ -156,7 +156,7 @@ fn default_ollama_endpoint() -> String {
 
 impl PocConfig {
     pub fn load(project_root: &Path) -> Result<Self> {
-        let local = project_root.join("poc.toml");
+        let local = project_root.join(".poc").join("config.toml");
         if local.exists() {
             let content = std::fs::read_to_string(&local)?;
             return Ok(toml::from_str(&content)?);
@@ -175,4 +175,98 @@ impl PocConfig {
 
 fn global_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("poc").join("config.toml"))
+}
+
+pub fn generate_config(root: &Path, projects: &[crate::types::DetectedProject]) -> Result<()> {
+    use crate::types::Language;
+    let poc_dir = root.join(".poc");
+    let _ = std::fs::create_dir_all(&poc_dir);
+    let config_path = poc_dir.join("config.toml");
+    if config_path.exists() {
+        anyhow::bail!(
+            ".poc/config.toml already exists at {}",
+            config_path.display()
+        );
+    }
+
+    let mut sections = Vec::new();
+    let has_ts = projects.iter().any(|p| p.language == Language::TypeScript);
+    let has_python = projects.iter().any(|p| p.language == Language::Python);
+    let has_c = projects.iter().any(|p| p.language == Language::C);
+    let has_rust = projects.iter().any(|p| p.language == Language::Rust);
+
+    if has_ts {
+        sections.push("[ts]\nruntime = \"bun\"\npackage_manager = \"bun\"".to_string());
+    }
+    if has_python {
+        sections.push("[python]\nrunner = \"uv\"".to_string());
+    }
+    if has_c {
+        sections.push("[c]\ncompiler = \"clang\"\nbuild_system = \"cmake\"".to_string());
+    }
+    if has_rust {
+        sections.push("[rust]\nlinker = \"default\"".to_string());
+    }
+
+    let mut lint_entries = Vec::new();
+    if has_ts {
+        lint_entries.push("ts = \"biome\"".to_string());
+    }
+    if has_python {
+        lint_entries.push("python = \"ruff\"".to_string());
+    }
+    if has_rust {
+        lint_entries.push("rust = \"clippy\"".to_string());
+    }
+    if !lint_entries.is_empty() {
+        sections.push(format!("[lint]\n{}", lint_entries.join("\n")));
+    }
+
+    sections.push(
+        "[ai]\nprovider = \"ollama\"\nmodel = \"llama3\"\nendpoint = \"http://0.0.0.0:11434\""
+            .to_string(),
+    );
+
+    let content = sections.join("\n\n");
+    std::fs::write(&config_path, &content)?;
+    Ok(())
+}
+
+pub fn validate_config(root: &Path) -> Vec<String> {
+    let config_path = root.join(".poc").join("config.toml");
+    let mut warnings = Vec::new();
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return warnings,
+    };
+
+    let table: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            warnings.push(format!("failed to parse .poc/config.toml: {e}"));
+            return warnings;
+        }
+    };
+
+    let known_sections = ["ts", "python", "c", "rust", "lint", "ai"];
+    for key in table.keys() {
+        if !known_sections.contains(&key.as_str()) {
+            warnings.push(format!("unknown section [{key}] in .poc/config.toml"));
+        }
+    }
+
+    if let Some(ai) = table.get("ai").and_then(|v| v.as_table()) {
+        if let Some(provider) = ai.get("provider").and_then(|v| v.as_str()) {
+            let valid = ["ollama", "anthropic", "openai"];
+            if !valid.contains(&provider) {
+                warnings.push(format!(
+                    "unknown AI provider '{provider}' — expected one of: {}",
+                    valid.join(", ")
+                ));
+            }
+        }
+    }
+
+    warnings
 }
